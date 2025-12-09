@@ -1,0 +1,38 @@
+cargo-features = ["different-binary-name"]
+
+[package]
+name = "flipper_zero_wallet"
+version = "0.1.0"
+edition = "2021"
+authors = ["blueokanna@gmail.com"]
+description = "BIP39 HD Wallet for Flipper Zero"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "flipper_zero_wallet"
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+default = ["flipper"]
+flipper = []
+
+[dependencies]
+flipperzero = { version = "0.15.0" }
+flipperzero-sys = { version = "0.15.0" }
+flipperzero-rt = { version = "0.15.0" }
+flipperzero-alloc = { version = "0.15.0" }
+
+[profile.dev]
+panic = "abort"
+lto = true
+opt-level = "z"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
