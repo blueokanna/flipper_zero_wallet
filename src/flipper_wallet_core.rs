@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 pub type WalletResult<T> = Result<T, WalletError>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum WalletError {
     InvalidEntropy,
     InvalidMnemonic,
@@ -48,6 +48,12 @@ impl From<&'static str> for WalletError {
             s if s.contains("path") => WalletError::InvalidPath,
             _ => WalletError::InvalidKey,
         }
+    }
+}
+
+impl core::fmt::Debug for WalletError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self)
     }
 }
 
@@ -147,13 +153,21 @@ impl Wallet {
         })
     }
 
+    /// 添加一个新账户（指定币种、账户索引和地址索引）
     pub fn add_account(
         &mut self,
         cryptocurrency: Cryptocurrency,
         account_index: u32,
         address_index: u32,
-    ) -> WalletResult<&AccountInfo> {
+    ) -> WalletResult<()> {
         let coin_type = cryptocurrency.coin_type();
+
+        // 检查账户是否已存在
+        for account in &self.accounts {
+            if account.cryptocurrency == cryptocurrency && account.account_index == address_index {
+                return Ok(()); // 已存在，无需添加
+            }
+        }
 
         let secret_key = self
             .master_key
@@ -172,6 +186,7 @@ impl Wallet {
         let address =
             FixedString::from_str(address_str).map_err(|_| WalletError::AddressTooLong)?;
 
+        // 构建派生路径字符串
         let mut derivation_path_str = FixedString::<64>::new();
         derivation_path_str
             .push_str("m/44'/")
@@ -210,8 +225,7 @@ impl Wallet {
         };
 
         self.accounts.push(account);
-
-        Ok(self.accounts.last().unwrap())
+        Ok(())
     }
 
     pub fn get_address(

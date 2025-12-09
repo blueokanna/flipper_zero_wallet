@@ -3,6 +3,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use crate::sha256::Sha256;
 use crate::secp256k1::PublicKey;
+use crate::ripemd160::Ripemd160;
+use crate::keccak256::Keccak256;
 
 /// 支持的加密货币类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,15 +72,9 @@ impl Cryptocurrency {
     }
 }
 
-/// RIPEMD-160 哈希（简化实现，使用 SHA-256 的前 20 字节）
-fn ripemd160_simple(data: &[u8]) -> [u8; 20] {
-    // 注意：这是一个简化版本，实际应该使用真正的 RIPEMD-160
-    // 这里使用双重 SHA-256 的前 20 字节作为替代
-    let hash1 = Sha256::digest(data);
-    let hash2 = Sha256::digest(&hash1);
-    let mut result = [0u8; 20];
-    result.copy_from_slice(&hash2[..20]);
-    result
+/// RIPEMD-160 哈希函数
+fn ripemd160(data: &[u8]) -> [u8; 20] {
+    Ripemd160::digest(data)
 }
 
 /// Ripple 专用的 Base58 字母表
@@ -170,7 +166,7 @@ pub fn generate_bitcoin_address(public_key: &PublicKey, prefix: u8) -> Result<Ve
     let sha256_hash = Sha256::digest(&compressed_pubkey);
     
     // RIPEMD-160
-    let ripemd160_hash = ripemd160_simple(&sha256_hash);
+    let ripemd160_hash = ripemd160(&sha256_hash);
     
     // 添加版本字节
     let mut versioned = Vec::with_capacity(21);
@@ -187,14 +183,14 @@ pub fn generate_ethereum_address(public_key: &PublicKey) -> Result<Vec<u8>, &'st
     let uncompressed = public_key.serialize_uncompressed();
     let pubkey_no_prefix = &uncompressed[1..65];
     
-    // Keccak-256 哈希（简化：使用 SHA-256）
-    let hash = Sha256::digest(pubkey_no_prefix);
+    // Keccak-256 哈希
+    let hash = Keccak256::digest(pubkey_no_prefix);
     
     // 取后 20 字节作为地址
     let mut address = Vec::with_capacity(42); // "0x" + 40 hex chars
     address.extend_from_slice(b"0x");
     
-    // 转换为十六进制（简化版本）
+    // 转换为十六进制
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
     for &byte in &hash[12..32] {
         address.push(HEX_CHARS[(byte >> 4) as usize]);
@@ -212,7 +208,7 @@ pub fn generate_address(public_key: &PublicKey, cryptocurrency: Cryptocurrency) 
             // Ripple 使用特殊的 Base58 编码和字母表
             let compressed_pubkey = public_key.serialize_compressed();
             let sha256_hash = Sha256::digest(&compressed_pubkey);
-            let ripemd160_hash = ripemd160_simple(&sha256_hash);
+            let ripemd160_hash = ripemd160(&sha256_hash);
             
             // 计算校验和（双重 SHA-256 的前 4 字节）
             let hash1 = Sha256::digest(&ripemd160_hash);
