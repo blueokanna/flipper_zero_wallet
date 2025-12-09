@@ -11,9 +11,16 @@ autoexamples = false
 autotests = false
 autobenches = false
 
-[lib]
+#[lib]
+#name = "flipper_zero_wallet"
+#crate-type = ["cdylib", "staticlib"]
+
+
+[[bin]]
 name = "flipper_zero_wallet"
-crate-type = ["cdylib", "staticlib"]
+filename = "flipper_zero_wallet.fap"
+bench = false
+test = false
 
 [features]
 default = ["flipper"]
