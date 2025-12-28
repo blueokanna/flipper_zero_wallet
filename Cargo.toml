@@ -25,6 +25,7 @@ test = false
 [features]
 default = ["flipper"]
 flipper = []
+bip39-multi-lang = []
 
 [dependencies]
 flipperzero = { version = "0.15.0" }

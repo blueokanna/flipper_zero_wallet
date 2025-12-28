@@ -2049,6 +2049,7 @@ pub static ENGLISH_WORD_LIST: &[&str] = &[
   "zoo"
 ];
 
+#[cfg(feature = "bip39-multi-lang")]
 pub static CHINESE_WORD_LIST: &[&str] = &[
   "的",
   "一",
@@ -4100,6 +4101,7 @@ pub static CHINESE_WORD_LIST: &[&str] = &[
   "歇"
 ];
 
+#[cfg(feature = "bip39-multi-lang")]
 pub static FRENCH_WORD_LIST: &[&str] = &[
   "abaisser",
 "abandon",

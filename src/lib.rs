@@ -1,6 +1,4 @@
-#![no_main]
 #![no_std]
-#[warn(dead_code)]
 extern crate alloc;
 extern crate flipperzero_alloc;
 extern crate flipperzero_rt;
@@ -23,18 +21,8 @@ pub mod storage;
 pub mod trng;
 pub mod word_list;
 
-use core::ffi::CStr;
-use flipperzero_rt::{entry, manifest};
-
-manifest!(
-    name = "FlipCrypto Wallet",
-    app_version = 1,
-    has_icon = true,
-    icon = "../assets/wallet-10x10.icon",
-);
-
-entry!(main);
-
-fn main(_args: Option<&CStr>) -> i32 {
-    flipper_app::app_main()
+#[allow(dead_code)]
+fn main(_args: *mut u8) -> i32 {
+    flipper_app::app_main();
+    0
 }

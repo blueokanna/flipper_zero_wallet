@@ -3,7 +3,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use crate::fixed_string::FixedString;
 
-/// 将字节数组编码为十六进制字符串
 pub fn encode(data: &[u8]) -> FixedString<256> {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
     let mut result = FixedString::new();
@@ -18,7 +17,6 @@ pub fn encode(data: &[u8]) -> FixedString<256> {
     result
 }
 
-/// 将字节数组编码为十六进制字符串（使用固定大小字符串）
 pub fn encode_to_fixed<const N: usize>(data: &[u8]) -> Result<FixedString<N>, &'static str> {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
     let mut result = FixedString::new();
@@ -33,7 +31,6 @@ pub fn encode_to_fixed<const N: usize>(data: &[u8]) -> Result<FixedString<N>, &'
     Ok(result)
 }
 
-/// 将十六进制字符串解码为字节数组
 pub fn decode(hex: &str) -> Result<Vec<u8>, &'static str> {
     let mut result = Vec::new();
     let chars: Vec<char> = hex.chars().collect();

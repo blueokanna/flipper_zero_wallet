@@ -58,7 +58,6 @@ impl Cryptocurrency {
         }
     }
     
-    /// 获取地址版本字节
     pub fn address_prefix(&self) -> u8 {
         match self {
             Cryptocurrency::Bitcoin => 0x00,
@@ -144,7 +143,6 @@ fn ripple_base58_encode(data: &[u8]) -> Vec<u8> {
 
 /// Base58Check 编码（带校验和，使用标准字母表）
 fn base58check_encode(payload: &[u8]) -> Vec<u8> {
-    // 计算校验和（双重 SHA-256 的前 4 字节）
     let hash1 = Sha256::digest(payload);
     let hash2 = Sha256::digest(&hash1);
     let checksum = &hash2[..4];
@@ -179,7 +177,6 @@ pub fn generate_bitcoin_address(public_key: &PublicKey, prefix: u8) -> Result<Ve
 
 /// 生成 Ethereum 地址
 pub fn generate_ethereum_address(public_key: &PublicKey) -> Result<Vec<u8>, &'static str> {
-    // 获取未压缩公钥（去掉 0x04 前缀）
     let uncompressed = public_key.serialize_uncompressed();
     let pubkey_no_prefix = &uncompressed[1..65];
     
@@ -221,7 +218,6 @@ pub fn generate_address(public_key: &PublicKey, cryptocurrency: Cryptocurrency) 
             data.extend_from_slice(&ripemd160_hash);
             data.extend_from_slice(checksum);
             
-            // 使用 Ripple 专用的 Base58 编码
             Ok(ripple_base58_encode(&data))
         }
         _ => {

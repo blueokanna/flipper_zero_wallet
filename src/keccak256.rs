@@ -1,17 +1,12 @@
 // Keccak-256 哈希上下文
 pub struct Keccak256 {
-    /// Keccak 状态（25 个 64 位字）
     state: [u64; 25],
-    /// 缓冲区
     buffer: [u8; 136],
-    /// 缓冲区长度
     buffer_len: usize,
-    /// 是否已完成
     finalized: bool,
 }
 
 impl Keccak256 {
-    /// 创建新的 Keccak-256 上下文
     pub fn new() -> Self {
         Self {
             state: [0u64; 25],

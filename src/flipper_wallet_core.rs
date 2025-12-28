@@ -6,9 +6,7 @@ use crate::bip39::{entropy_to_mnemonic, mnemonic_to_entropy, validate_mnemonic, 
 use crate::fixed_string::FixedString;
 use crate::pbkdf2::mnemonic_to_seed;
 use crate::secp256k1::PublicKey;
-use alloc::vec::Vec;
-
-pub type WalletResult<T> = Result<T, WalletError>;
+use alloc::vec::Vec;pub type WalletResult<T> = Result<T, WalletError>;
 
 #[derive(Clone, Copy)]
 pub enum WalletError {

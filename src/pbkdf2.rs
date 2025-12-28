@@ -1,5 +1,3 @@
-//! PBKDF2 实现（no_std 兼容）
-
 extern crate alloc;
 
 use alloc::vec::Vec;

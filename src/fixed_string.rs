@@ -1,5 +1,3 @@
-//! 固定大小字符串类型（no_std 兼容）
-
 use core::fmt;
 use core::str::FromStr;
 

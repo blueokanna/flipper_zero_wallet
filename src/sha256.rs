@@ -1,6 +1,3 @@
-//! SHA-256 哈希算法实现（no_std 兼容）
-
-/// SHA-256 哈希上下文
 pub struct Sha256 {
     state: [u32; 8],
     length: u64,
