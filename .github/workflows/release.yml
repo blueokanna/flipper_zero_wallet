@@ -1,0 +1,61 @@
+name: Release FAP
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PACKAGE_NAME: flipper_zero_wallet
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install nightly toolchain with target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          targets: thumbv7em-none-eabihf
+
+      - name: Cache cargo dirs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release FAP
+        run: cargo +nightly build --release --target thumbv7em-none-eabihf
+
+      - name: Rename artifact with ref
+        run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          OUT="target/thumbv7em-none-eabihf/release/${PACKAGE_NAME}.fap"
+          RENAMED="target/thumbv7em-none-eabihf/release/${PACKAGE_NAME}-${TAG}.fap"
+          cp "$OUT" "$RENAMED"
+          echo "RENAMED=$RENAMED" >> $GITHUB_ENV
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}-${{ github.ref_name }}
+          path: ${{ env.RENAMED }}
+          if-no-files-found: error
+
+      - name: Attach asset to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.RENAMED }}
