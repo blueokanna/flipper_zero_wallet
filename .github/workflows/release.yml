@@ -1,8 +1,9 @@
 name: Release FAP
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 env:
@@ -20,10 +21,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install nightly toolchain with target
+      - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          toolchain: nightly-2024-09-10
           targets: thumbv7em-none-eabihf
 
       - name: Cache cargo dirs
@@ -37,9 +38,9 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build release FAP
-        run: cargo +nightly build --release --target thumbv7em-none-eabihf
+        run: cargo +nightly-2024-09-10 build --release --target thumbv7em-none-eabihf
 
-      - name: Rename artifact with ref
+      - name: Rename artifact with tag
         run: |
           TAG="${GITHUB_REF_NAME:-dev}"
           OUT="target/thumbv7em-none-eabihf/release/${PACKAGE_NAME}.fap"
@@ -54,8 +55,10 @@ jobs:
           path: ${{ env.RENAMED }}
           if-no-files-found: error
 
-      - name: Attach asset to Release
-        if: github.event_name == 'release'
+      - name: Create or update Release with asset
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.RENAMED }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
