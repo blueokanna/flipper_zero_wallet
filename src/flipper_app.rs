@@ -6,6 +6,7 @@ use crate::bip39::{entropy_to_mnemonic, MnemonicType};
 use crate::flipper_wallet_core::Wallet;
 use crate::hex;
 use crate::trng;
+use crate::word_list::ENGLISH_WORD_LIST;
 use alloc::vec::Vec;
 
 const MAX_MNEMONIC_LEN: usize = 256;
@@ -13,6 +14,18 @@ const MAX_PASSPHRASE_LEN: usize = 64;
 const MAIN_MENU_VISIBLE: usize = 4;
 const SETTINGS_VISIBLE: usize = 4;
 const MNEMONIC_VISIBLE: usize = 4;
+const SUGGESTION_MAX: usize = 8;
+const SUGGESTION_VISIBLE: usize = 4;
+// (multi-row keyboard definitions removed; using physical-key mapping CHARSET instead)
+
+// linear charset used when no suggestions present (letters, dash, underscore, space, digits)
+const CHARSET: [&str; 39] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z", "-", "_", " ", "0", "1", "2", "3", "4", "5", "6", "7", "8",
+    "9",
+];
+
+// helper functions for previous on-screen keyboard removed
 const SCROLLBAR_WIDTH: i32 = 6;
 // QR visual tuning
 const QR_BORDER_THICKNESS: i32 = 1;
@@ -48,6 +61,7 @@ pub enum ConfirmAction {
     ExportMnemonic = 2,
     ClearPassphrase = 3,
     RevealPrivate = 4,
+    SaveWallet = 5,
 }
 
 #[repr(C)]
@@ -94,9 +108,35 @@ pub struct AppState {
     // Confirmation
     pub confirm_action: ConfirmAction,
     pub confirm_index: usize,
+    // last saved AES password (shown once to user after saving to SD)
+    pub last_saved_aes: [u8; 32],
+    pub last_saved_aes_len: usize,
+    pub last_saved_path: alloc::string::String,
     // Wallet storage
     pub wallets: Vec<Wallet>,
     pub current_wallet: usize,
+    // Import flow state
+    pub import_words: Vec<alloc::string::String>,
+    pub import_word_index: usize,
+    pub import_total_words: usize,
+    pub selecting_word: bool,
+    pub wordlist_index: usize,
+    pub wordlist_scroll: usize,
+    // Suggestions for text entry (prefix search over ENGLISH_WORD_LIST)
+    pub suggestion_indices: [usize; SUGGESTION_MAX],
+    pub suggestion_count: usize,
+    pub suggestion_total: usize,
+    pub suggestion_selected: usize,
+    // whether we're editing the BIP39 passphrase instead of a mnemonic word
+    pub editing_passphrase: bool,
+    // whether to use the system keyboard/dialog for text entry (hide custom hints)
+    pub use_system_keyboard: bool,
+    // one-shot shift (Aa) state for keyboard (uppercase next char)
+    pub shift_enabled: bool,
+    // on-screen keyboard index for TextInput
+    pub keyboard_index: usize,
+    // index into CHARSET when no suggestions present
+    pub char_index: usize,
     // creation flags to avoid heavy work in input callback
     pub create_requested: bool,
     pub create_in_progress: bool,
@@ -113,6 +153,10 @@ pub struct AppState {
     // stored entropy for later derivation (0..32 bytes)
     pub entropy_buffer: [u8; 32],
     pub entropy_len: usize,
+    // Background save flags to avoid doing heavy work in input callback
+    pub save_requested: bool,
+    pub save_in_progress: bool,
+    pub save_error: i32,
     // title scrolling state
     pub title_scroll_offset: i32,
     pub title_scroll_dir: i8,
@@ -142,6 +186,21 @@ impl AppState {
             confirm_index: 0,
             wallets: Vec::new(),
             current_wallet: 0,
+            import_words: Vec::new(),
+            import_word_index: 0,
+            import_total_words: 12,
+            selecting_word: false,
+            wordlist_index: 0,
+            wordlist_scroll: 0,
+            suggestion_indices: [0usize; SUGGESTION_MAX],
+            suggestion_count: 0,
+            suggestion_total: 0,
+            suggestion_selected: 0,
+            editing_passphrase: false,
+            use_system_keyboard: false,
+            shift_enabled: false,
+            keyboard_index: 0,
+            char_index: 0,
             create_requested: false,
             create_in_progress: false,
             create_error: 0,
@@ -156,6 +215,12 @@ impl AppState {
             title_scroll_dir: 1,
             title_scroll_tick: 0,
             showing_qr: false,
+            save_requested: false,
+            save_in_progress: false,
+            save_error: 0,
+            last_saved_aes: [0u8; 32],
+            last_saved_aes_len: 0,
+            last_saved_path: alloc::string::String::new(),
         }
     }
 
@@ -197,7 +262,7 @@ pub extern "C" fn app_main() -> i32 {
     unsafe {
         // Get GUI handle
         let gui_name = b"gui\0";
-        let gui = sys::furi_record_open(gui_name.as_ptr() as *const i8);
+        let gui = sys::furi_record_open(gui_name.as_ptr() as *const u8);
         if gui.is_null() {
             return -1;
         }
@@ -205,13 +270,13 @@ pub extern "C" fn app_main() -> i32 {
         // Create viewport
         let viewport = sys::view_port_alloc();
         if viewport.is_null() {
-            sys::furi_record_close(gui_name.as_ptr() as *const i8);
+            sys::furi_record_close(gui_name.as_ptr() as *const u8);
             return -1;
         }
 
-        // Create state
-        let mut state = AppState::new();
-        let state_ptr = &mut state as *mut AppState as *mut c_void;
+        // Create state (allocate on heap to avoid stack overflow on constrained device)
+        let mut state = alloc::boxed::Box::new(AppState::new());
+        let state_ptr = (&mut *state) as *mut AppState as *mut c_void;
 
         // Set callbacks
         sys::view_port_draw_callback_set(viewport, Some(draw_callback), state_ptr);
@@ -339,6 +404,106 @@ pub extern "C" fn app_main() -> i32 {
                 }
             }
 
+            // If wallet save was requested from input callback, perform it here (background)
+            if state.save_requested && !state.save_in_progress {
+                state.save_requested = false;
+                state.save_in_progress = true;
+
+                // request a redraw so UI can show "Saving..."
+                sys::view_port_update(viewport);
+
+                // Temporarily disable callbacks to avoid concurrent access while saving
+                let null_ctx: *mut c_void = core::ptr::null_mut();
+                sys::view_port_draw_callback_set(viewport, None, null_ctx);
+                sys::view_port_input_callback_set(viewport, None, null_ctx);
+
+                // Perform save: build WalletData from current state
+                let mnemonic_str = match core::str::from_utf8(&state.mnemonic_buffer) {
+                    Ok(s) => s.trim(),
+                    Err(_) => "",
+                };
+                if !mnemonic_str.is_empty() {
+                    let wdata = crate::storage::WalletData {
+                        name: alloc::format!("wallet-{}", state.wallets.len() + 1),
+                        mnemonic: alloc::string::String::from(mnemonic_str),
+                        passphrase: alloc::string::String::from(
+                            core::str::from_utf8(&state.passphrase_buffer[..state.passphrase_len])
+                                .unwrap_or(""),
+                        ),
+                        word_count: state.bip39_word_count as u16,
+                    };
+
+                    // generate AES passphrase and encrypt
+                    let aes_pass = crate::storage::generate_random_passphrase(10);
+                    let salt = crate::trng::get_random_salt();
+                    let iv = crate::trng::get_random_iv();
+                    let file_bytes = crate::storage::save_wallet(&wdata, &aes_pass, &salt, &iv);
+
+                    // build filename
+                    let filename = alloc::format!("/ext/apps_data/flipperwallet/wallet_{}.dat\0", state.wallets.len() + 1);
+                    // Try to persist using storage::persist_file (caller replaces with platform API)
+                    let save_res = crate::storage::persist_file(&filename, &file_bytes);
+                    match save_res {
+                        Ok(()) => {
+                            // record AES pass to show once
+                            let apb = aes_pass.as_bytes();
+                            let len = core::cmp::min(apb.len(), state.last_saved_aes.len());
+                            for i in 0..len {
+                                state.last_saved_aes[i] = apb[i];
+                            }
+                            state.last_saved_aes_len = len;
+                            state.last_saved_path = alloc::string::String::from(
+                                filename.trim_end_matches(char::from(0)),
+                            );
+                            // Also add wallet into in-memory list
+                            if let Ok(mut wallet) = Wallet::from_mnemonic(
+                                wdata.mnemonic.as_str(),
+                                wdata.passphrase.as_str(),
+                            ) {
+                                let _ = wallet.add_account(
+                                    crate::address::Cryptocurrency::Bitcoin,
+                                    0,
+                                    0,
+                                );
+                                state.wallets.push(wallet);
+                                state.current_wallet = state.wallets.len().saturating_sub(1);
+                            }
+                            state.save_error = 0;
+                            // After successful save, go to ViewWallets and show list
+                            state.current_screen = Screen::ViewWallets;
+                            state.menu_index = 0;
+                        }
+                        Err(_) => {
+                            // persist failed (platform not implemented). Still add wallet to in-memory list
+                            if let Ok(mut wallet) = Wallet::from_mnemonic(
+                                wdata.mnemonic.as_str(),
+                                wdata.passphrase.as_str(),
+                            ) {
+                                let _ = wallet.add_account(
+                                    crate::address::Cryptocurrency::Bitcoin,
+                                    0,
+                                    0,
+                                );
+                                state.wallets.push(wallet);
+                                state.current_wallet = state.wallets.len().saturating_sub(1);
+                            }
+                            // mark error but still navigate to ViewWallets so user can see wallet in UI
+                            state.save_error = 1;
+                            state.current_screen = Screen::ViewWallets;
+                            state.menu_index = 0;
+                        }
+                    }
+                } else {
+                    state.save_error = 2;
+                }
+
+                // Re-enable callbacks
+                sys::view_port_draw_callback_set(viewport, Some(draw_callback), state_ptr);
+                sys::view_port_input_callback_set(viewport, Some(input_callback), state_ptr);
+
+                state.save_in_progress = false;
+            }
+
             // advance title scroll tick and update offset if on main menu
             state.title_scroll_tick = state.title_scroll_tick.wrapping_add(1);
             if state.current_screen == Screen::MainMenu {
@@ -376,7 +541,7 @@ pub extern "C" fn app_main() -> i32 {
         // Cleanup
         sys::gui_remove_view_port(gui as *mut sys::Gui, viewport);
         sys::view_port_free(viewport);
-        sys::furi_record_close(gui_name.as_ptr() as *const i8);
+        sys::furi_record_close(gui_name.as_ptr() as *const u8);
 
         0
     }
@@ -423,7 +588,7 @@ unsafe fn draw_main_menu(canvas: *mut sys::Canvas, state: &AppState) {
     let title = b"Flipper Zero Crypto Wallet\0";
     let title_height = 8;
     let x_off = 4 - state.title_scroll_offset;
-    sys::canvas_draw_str(canvas, x_off, title_height, title.as_ptr() as *const i8);
+    sys::canvas_draw_str(canvas, x_off, title_height, title.as_ptr() as *const u8);
 
     sys::canvas_set_font(canvas, sys::FontSecondary);
     sys::canvas_set_color(canvas, sys::ColorBlack);
@@ -459,7 +624,7 @@ unsafe fn draw_create_wallet(canvas: *mut sys::Canvas, state: &AppState) {
     let title = b"Create Flipper Wallet\0";
     let x_off: i32 = 6 - state.title_scroll_offset;
     let title_height = 8;
-    sys::canvas_draw_str(canvas, x_off, title_height, title.as_ptr() as *const i8);
+    sys::canvas_draw_str(canvas, x_off, title_height, title.as_ptr() as *const u8);
 
     // Original labels
     let orig_items = [
@@ -524,8 +689,397 @@ unsafe fn draw_import_wallet(canvas: *mut sys::Canvas, state: &AppState) {
     let title = b"Import Flipper Wallet\0";
     let x_off: i32 = 6 - state.title_scroll_offset;
     let title_height = 8;
-    sys::canvas_draw_str(canvas, x_off, title_height, title.as_ptr() as *const i8);
+    sys::canvas_draw_str(canvas, x_off, title_height, title.as_ptr() as *const u8);
 
+    if state.selecting_word {
+        {
+            // small stack buffer for "Select word X/Y\0"
+            let mut hdr_buf: [u8; 32] = [0u8; 32];
+            let prefix = b"Select word ";
+            let mut pos = 0usize;
+            // copy prefix
+            while pos < prefix.len() && pos < hdr_buf.len() - 1 {
+                hdr_buf[pos] = prefix[pos];
+                pos += 1;
+            }
+            // write number X
+            let mut n = state.import_word_index + 1;
+            let mut digits: [u8; 4] = [0u8; 4];
+            let mut dlen = 0usize;
+            if n == 0 {
+                digits[0] = b'0';
+                dlen = 1;
+            } else {
+                while n > 0 && dlen < digits.len() {
+                    digits[dlen] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    dlen += 1;
+                }
+            }
+            // append digits in correct order
+            for i in 0..dlen {
+                if pos < hdr_buf.len() - 1 {
+                    hdr_buf[pos] = digits[dlen - 1 - i];
+                    pos += 1;
+                }
+            }
+            // slash '/'
+            if pos < hdr_buf.len() - 1 {
+                hdr_buf[pos] = b'/';
+                pos += 1;
+            }
+            // write total words number
+            let mut m = state.import_total_words;
+            let mut mdigits: [u8; 4] = [0u8; 4];
+            let mut mdlen = 0usize;
+            if m == 0 {
+                mdigits[0] = b'0';
+                mdlen = 1;
+            } else {
+                while m > 0 && mdlen < mdigits.len() {
+                    mdigits[mdlen] = b'0' + (m % 10) as u8;
+                    m /= 10;
+                    mdlen += 1;
+                }
+            }
+            for i in 0..mdlen {
+                if pos < hdr_buf.len() - 1 {
+                    hdr_buf[pos] = mdigits[mdlen - 1 - i];
+                    pos += 1;
+                }
+            }
+            // null-terminate
+            if pos < hdr_buf.len() {
+                hdr_buf[pos] = 0;
+            } else {
+                hdr_buf[hdr_buf.len() - 1] = 0;
+            }
+            sys::canvas_draw_str(canvas, 8, title_height + 6, hdr_buf.as_ptr() as *const u8);
+        }
+
+        // show already-entered words inline without heap allocation by drawing each word sequentially
+        {
+            let mut x = 8i32;
+            let y = title_height + 18;
+            for i in 0..state.import_total_words {
+                if i < state.import_words.len() {
+                    let w = state.import_words[i].as_str();
+                    if !w.is_empty() {
+                        // create small stack buffer for this word
+                        let wb = w.as_bytes();
+                        let mut buf: [u8; 24] = [0u8; 24];
+                        let wlen = core::cmp::min(wb.len(), buf.len() - 1);
+                        buf[..wlen].copy_from_slice(&wb[..wlen]);
+                        buf[wlen] = 0;
+                        sys::canvas_draw_str(canvas, x, y, buf.as_ptr() as *const u8);
+                        // advance x by approx char width * (len + 1 space)
+                        let adv = ((wlen as i32) * 6) + 6;
+                        x += adv;
+                        // stop if running out of horizontal space
+                        if x > 120 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_words = ENGLISH_WORD_LIST.len();
+        let visible = MAIN_MENU_VISIBLE;
+
+        let mut scroll = state.wordlist_scroll;
+        if state.wordlist_index < scroll {
+            scroll = state.wordlist_index;
+        }
+        if state.wordlist_index >= scroll + visible {
+            scroll = state.wordlist_index - visible + 1;
+        }
+
+        // draw visible items without heap-allocating the whole list (use small stack buffer per word)
+        for i in 0..visible {
+            let idx = scroll + i;
+            if idx >= total_words {
+                break;
+            }
+            let y = title_height + 28 + (i as i32) * 12;
+            let margin = 6;
+            // layout similar to draw_menu_list
+            let display_w: i32 = 128;
+            let box_width = (display_w - margin - SCROLLBAR_WIDTH - 2).max(16);
+            let box_h = (12 + 2).max(10);
+            let box_top = y - 1;
+
+            if state.wordlist_index == idx {
+                sys::canvas_set_color(canvas, sys::ColorBlack);
+                sys::canvas_draw_box(canvas, margin, box_top, box_width as usize, box_h as usize);
+                sys::canvas_set_color(canvas, sys::ColorWhite);
+            } else {
+                sys::canvas_set_color(canvas, sys::ColorBlack);
+            }
+
+            let w = ENGLISH_WORD_LIST[idx];
+            let wb = w.as_bytes();
+            // words are short; use a small fixed buffer to create a nul-terminated string
+            let mut buf: [u8; 32] = [0u8; 32];
+            let wlen = core::cmp::min(wb.len(), buf.len() - 1);
+            buf[..wlen].copy_from_slice(&wb[..wlen]);
+            buf[wlen] = 0;
+            let text_y = box_top + box_h as i32 - 4;
+            sys::canvas_draw_str(canvas, margin + 6, text_y, buf.as_ptr() as *const u8);
+        }
+
+        // draw scrollbar if needed
+        if total_words > visible {
+            let track_x = 128 - 6;
+            let track_top = title_height + 12;
+            draw_scrollbar(canvas, scroll, visible, total_words, track_x, track_top, 12);
+        }
+
+        return;
+    }
+
+    // If user is typing a word (TextInput), show input field and suggestions
+    if state.input_mode == InputMode::TextInput {
+        {
+            let mut hdr_buf: [u8; 32] = [0u8; 32];
+            let prefix = b"Enter word ";
+            let mut pos = 0usize;
+            while pos < prefix.len() && pos < hdr_buf.len() - 1 {
+                hdr_buf[pos] = prefix[pos];
+                pos += 1;
+            }
+            // number
+            let mut n = state.import_word_index + 1;
+            let mut digits: [u8; 4] = [0u8; 4];
+            let mut dlen = 0usize;
+            if n == 0 {
+                digits[0] = b'0';
+                dlen = 1;
+            } else {
+                while n > 0 && dlen < digits.len() {
+                    digits[dlen] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    dlen += 1;
+                }
+            }
+            for i in 0..dlen {
+                if pos < hdr_buf.len() - 1 {
+                    hdr_buf[pos] = digits[dlen - 1 - i];
+                    pos += 1;
+                }
+            }
+            // slash and total
+            if pos < hdr_buf.len() - 1 {
+                hdr_buf[pos] = b'/';
+                pos += 1;
+            }
+            let mut m = state.import_total_words;
+            let mut mdigits: [u8; 4] = [0u8; 4];
+            let mut mdlen = 0usize;
+            if m == 0 {
+                mdigits[0] = b'0';
+                mdlen = 1;
+            } else {
+                while m > 0 && mdlen < mdigits.len() {
+                    mdigits[mdlen] = b'0' + (m % 10) as u8;
+                    m /= 10;
+                    mdlen += 1;
+                }
+            }
+            for i in 0..mdlen {
+                if pos < hdr_buf.len() - 1 {
+                    hdr_buf[pos] = mdigits[mdlen - 1 - i];
+                    pos += 1;
+                }
+            }
+            if pos < hdr_buf.len() {
+                hdr_buf[pos] = 0;
+            } else {
+                hdr_buf[hdr_buf.len() - 1] = 0;
+            }
+            sys::canvas_draw_str(canvas, 8, title_height + 12, hdr_buf.as_ptr() as *const u8);
+        }
+
+        // current fragment (show passphrase buffer when editing_passphrase)
+        let frag = if state.editing_passphrase {
+            match core::str::from_utf8(&state.passphrase_buffer[..state.passphrase_len]) {
+                Ok(s) => s,
+                Err(_) => "",
+            }
+        } else {
+            if state.import_words.len() > state.import_word_index {
+                state.import_words[state.import_word_index].as_str()
+            } else {
+                ""
+            }
+        };
+        {
+            let mut buf: [u8; 64] = [0u8; 64];
+            let fb = frag.as_bytes();
+            let blen = core::cmp::min(fb.len(), buf.len() - 1);
+            buf[..blen].copy_from_slice(&fb[..blen]);
+            buf[blen] = 0;
+            sys::canvas_draw_str(canvas, 8, title_height + 12 * 2, buf.as_ptr() as *const u8);
+        }
+
+        // compute prefix suggestions locally (no heap) unless the input handler already populated state.suggestion_*
+        let mut local_indices: [usize; SUGGESTION_MAX] = [0usize; SUGGESTION_MAX];
+        let mut local_count: usize = 0;
+        let mut total_matches: usize = 0;
+        if state.editing_passphrase {
+            // no suggestions when editing passphrase
+            local_count = 0;
+            total_matches = 0;
+        } else if state.suggestion_count > 0 {
+            // use state-provided suggestions (kept up-to-date by input handler)
+            for i in 0..state.suggestion_count {
+                if i < SUGGESTION_MAX {
+                    local_indices[i] = state.suggestion_indices[i];
+                }
+            }
+            local_count = state.suggestion_count;
+            total_matches = state.suggestion_total;
+        } else {
+            let prefix = frag.trim();
+            let pbytes = prefix.as_bytes();
+            let plen = pbytes.len();
+            if plen >= 2 {
+                for (i, &w) in ENGLISH_WORD_LIST.iter().enumerate() {
+                    let wb = w.as_bytes();
+                    if wb.len() < plen {
+                        continue;
+                    }
+                    let mut matched = true;
+                    for j in 0..plen {
+                        // case-insensitive ASCII compare (word list is lowercase)
+                        let a = wb[j];
+                        let b = pbytes[j];
+                        let b_lower = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+                        if a != b_lower {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        if local_count < SUGGESTION_MAX {
+                            local_indices[local_count] = i;
+                            local_count += 1;
+                        }
+                        total_matches += 1;
+                    }
+                }
+            }
+        }
+
+        // draw suggestion list (highlighted by state.suggestion_selected)
+        // compute available vertical space for suggestions so they don't overlap the char/hints area
+        let display_h: i32 = 64;
+        let char_area_top: i32 = display_h - 18; // area used by Char/hints
+        let suggestion_top: i32 = title_height + 30;
+        let visible: usize;
+        if char_area_top > suggestion_top + 4 {
+            let avail = char_area_top - suggestion_top - 4;
+            visible = core::cmp::min((avail / 12) as usize, SUGGESTION_VISIBLE);
+        } else {
+            visible = 0;
+        }
+        for i in 0..core::cmp::min(local_count, visible) {
+            let idx = local_indices[i];
+            let y = suggestion_top + (i as i32) * 12;
+            let margin = 8;
+            let box_top = y - 1;
+            let box_h = (12 + 2).max(10);
+            if state.suggestion_selected == i {
+                sys::canvas_set_color(canvas, sys::ColorBlack);
+                let display_w: i32 = 128;
+                let box_width = (display_w - margin - SCROLLBAR_WIDTH - 2).max(16);
+                sys::canvas_draw_box(canvas, margin, box_top, box_width as usize, box_h as usize);
+                sys::canvas_set_color(canvas, sys::ColorWhite);
+            } else {
+                sys::canvas_set_color(canvas, sys::ColorBlack);
+            }
+            let w = ENGLISH_WORD_LIST[idx];
+            let wb = w.as_bytes();
+            let mut buf: [u8; 32] = [0u8; 32];
+            let wlen = core::cmp::min(wb.len(), buf.len() - 1);
+            buf[..wlen].copy_from_slice(&wb[..wlen]);
+            buf[wlen] = 0;
+            let text_y = box_top + box_h as i32 - 4;
+            sys::canvas_draw_str(canvas, margin + 6, text_y, buf.as_ptr() as *const u8);
+        }
+
+        // if no room to draw suggestion rows but there are matches, show compact status line
+        if visible == 0 && total_matches > 0 {
+            let mut status_buf: [u8; 32] = [0u8; 32];
+            let status = b"Matches: ";
+            let mut pos = 0usize;
+            while pos < status.len() && pos < status_buf.len() - 1 {
+                status_buf[pos] = status[pos];
+                pos += 1;
+            }
+            // append count as decimal (capped)
+            let mut n = core::cmp::min(total_matches, 999);
+            let mut digits: [u8; 4] = [0u8; 4];
+            let mut dlen = 0usize;
+            if n == 0 {
+                digits[0] = b'0';
+                dlen = 1;
+            } else {
+                while n > 0 && dlen < digits.len() {
+                    digits[dlen] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    dlen += 1;
+                }
+            }
+            for i in 0..dlen {
+                if pos < status_buf.len() - 1 {
+                    status_buf[pos] = digits[dlen - 1 - i];
+                    pos += 1;
+                }
+            }
+            status_buf[pos] = 0;
+            sys::canvas_set_color(canvas, sys::ColorBlack);
+            sys::canvas_draw_str(canvas, 8, suggestion_top, status_buf.as_ptr() as *const u8);
+        } else if visible > 0 && total_matches > visible {
+            let track_x = 128 - 6;
+            let track_top = suggestion_top - 2;
+            draw_scrollbar(canvas, 0, visible, total_matches, track_x, track_top, 12);
+        }
+        // show current selected character (when no suggestions) and simple hints for physical-key mapping (Scheme A)
+        // When using the system keyboard/dialog, hide the custom character selector/hints.
+        if !state.use_system_keyboard {
+            let display_h: i32 = 64;
+            let y = display_h - 18;
+            // draw label "Char:" and selected char
+            sys::canvas_set_color(canvas, sys::ColorBlack);
+            sys::canvas_draw_str(canvas, 8, y, b"Char:\0".as_ptr() as *const u8);
+            // selected char
+            let mut cb: [u8; 8] = [0u8; 8];
+            let ch = CHARSET[state.char_index];
+            let chb = ch.as_bytes();
+            let clen = core::cmp::min(chb.len(), cb.len() - 1);
+            cb[..clen].copy_from_slice(&chb[..clen]);
+            cb[clen] = 0;
+            sys::canvas_draw_str(canvas, 40, y, cb.as_ptr() as *const u8);
+            // hints (short)
+            sys::canvas_draw_str(
+                canvas,
+                8,
+                y + 12,
+                b"Up/Down: cand/char  Left: Del\0".as_ptr() as *const u8,
+            );
+            sys::canvas_draw_str(
+                canvas,
+                8,
+                y + 24,
+                b"OK: Insert  Right: Accept  Back: Exit\0".as_ptr() as *const u8,
+            );
+        }
+
+        return;
+    }
+
+    // default import menu
     let items = [
         b"Enter Mnemonic  \0",
         b"Enter Passphrase\0",
@@ -548,7 +1102,7 @@ unsafe fn draw_import_wallet(canvas: *mut sys::Canvas, state: &AppState) {
 
     if state.passphrase_len > 0 {
         sys::canvas_set_color(canvas, sys::ColorBlack);
-        sys::canvas_draw_str(canvas, 8, 70, b"Passphrase: Set\0".as_ptr() as *const i8);
+        sys::canvas_draw_str(canvas, 8, 70, b"Passphrase: Set\0".as_ptr() as *const u8);
     }
 }
 
@@ -559,8 +1113,16 @@ unsafe fn draw_view_wallets(canvas: *mut sys::Canvas, state: &AppState) {
     // List addresses from current wallet
     let title = b"View Flipper Wallets\0";
     let title_height = 8;
+    sys::canvas_draw_str(canvas, 8, title_height, title.as_ptr() as *const u8);
     if state.wallets.is_empty() {
-        sys::canvas_draw_str(canvas, 8, title_height, title.as_ptr() as *const i8);
+        // draw centered "No Wallet Available"
+        let msg = b"No Wallet Available\0";
+        let char_w: i32 = 6;
+        let display_w: i32 = 128;
+        let text_w = ( (msg.len()-1) as i32 ) * char_w;
+        let x = (display_w - text_w) / 2;
+        let y = title_height + 20;
+        sys::canvas_draw_str(canvas, x, y, msg.as_ptr() as *const u8);
         return;
     }
     let wallet = &state.wallets[state.current_wallet];
@@ -579,7 +1141,7 @@ unsafe fn draw_view_wallets(canvas: *mut sys::Canvas, state: &AppState) {
         canvas,
         8,
         title_box_top + (title_box_h as i32) - 4,
-        b"View BTC wallet\0".as_ptr() as *const i8,
+        b"View BTC wallet\0".as_ptr() as *const u8,
     );
 
     // list starts below header
@@ -615,7 +1177,7 @@ unsafe fn draw_view_wallets(canvas: *mut sys::Canvas, state: &AppState) {
         }
         if let Ok(account) = wallet.get_account(idx) {
             let addr = account.address.as_str();
-            sys::canvas_draw_str(canvas, 12, y + 2, addr.as_ptr() as *const i8);
+            sys::canvas_draw_str(canvas, 12, y + 2, addr.as_ptr() as *const u8);
         }
     }
 
@@ -636,7 +1198,7 @@ unsafe fn draw_settings(canvas: *mut sys::Canvas, state: &AppState) {
         canvas,
         title_box_top,
         title_box_top + 3,
-        title.as_ptr() as *const i8,
+        title.as_ptr() as *const u8,
     );
 
     let word_counts = [12usize, 15, 18, 21, 24];
@@ -692,8 +1254,8 @@ unsafe fn draw_settings(canvas: *mut sys::Canvas, state: &AppState) {
         };
 
         let text_y = box_top + (box_h as i32) - 6;
-        sys::canvas_draw_str(canvas, 8, text_y, checkbox.as_ptr() as *const i8);
-        sys::canvas_draw_str(canvas, 28, text_y, label.as_ptr() as *const i8);
+        sys::canvas_draw_str(canvas, 8, text_y, checkbox.as_ptr() as *const u8);
+        sys::canvas_draw_str(canvas, 28, text_y, label.as_ptr() as *const u8);
     }
     // draw scrollbar if needed
     if total > visible {
@@ -719,7 +1281,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
         b"Mnemonic Words/QR Code\0"
     };
     let title_height = 8;
-    sys::canvas_draw_str(canvas, 8, title_height, title.as_ptr() as *const i8);
+    sys::canvas_draw_str(canvas, 8, title_height, title.as_ptr() as *const u8);
 
     // if creation in progress, show status
     if state.create_in_progress {
@@ -727,8 +1289,29 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
             canvas,
             8,
             title_height + 24,
-            b"Creating...\0".as_ptr() as *const i8,
+            b"Creating...\0".as_ptr() as *const u8,
         );
+        return;
+    }
+    // If we just saved a wallet to SD and have an AES shown-once password, display it here
+    if state.last_saved_aes_len > 0 {
+        // show saved path and AES password (warning: shown only once)
+        let mut path_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        path_buf.extend_from_slice(b"Saved: ");
+        path_buf.extend_from_slice(state.last_saved_path.as_bytes());
+        path_buf.push(0);
+        sys::canvas_draw_str(canvas, 8, title_height + 24, path_buf.as_ptr() as *const u8);
+
+        let mut aes_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        aes_buf.extend_from_slice(b"AES: ");
+        for i in 0..state.last_saved_aes_len {
+            aes_buf.push(state.last_saved_aes[i]);
+        }
+        aes_buf.push(0);
+        sys::canvas_draw_str(canvas, 8, title_height + 36, aes_buf.as_ptr() as *const u8);
+        sys::canvas_draw_str(canvas, 8, title_height + 48, b"Write down AES password (shown once)\0".as_ptr() as *const u8);
+        // Note: we do not clear the stored AES here because draw callbacks are immutable;
+        // it will be cleared when the user navigates away (in input handlers).
         return;
     }
     if state.create_error != 0 {
@@ -736,7 +1319,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
             canvas,
             8,
             title_height + 24,
-            b"Create failed\0".as_ptr() as *const i8,
+            b"Create failed\0".as_ptr() as *const u8,
         );
         return;
     }
@@ -752,7 +1335,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                 canvas,
                 8,
                 title_height + 30,
-                b"No private key\0".as_ptr() as *const i8,
+                b"No private key\0".as_ptr() as *const u8,
             );
             return;
         }
@@ -779,7 +1362,11 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
             // compute render area
             let display_w: i32 = 128;
             let display_h: i32 = 64;
-            let top = if state.show_private { title_height + 18 } else { title_height + 12 };
+            let top = if state.show_private {
+                title_height + 18
+            } else {
+                title_height + 12
+            };
             let bottom_margin = 4;
             let avail_w = display_w - 8;
             let avail_h = display_h - top - bottom_margin;
@@ -843,7 +1430,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                         canvas,
                         8,
                         qr_y + total_px + 6,
-                        b"Left: Back\0".as_ptr() as *const i8,
+                        b"Left: Back\0".as_ptr() as *const u8,
                     );
                     return;
                 }
@@ -867,7 +1454,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                         canvas,
                         dlg_x + 8,
                         dlg_y + 8,
-                        long_msg.as_ptr() as *const i8,
+                        long_msg.as_ptr() as *const u8,
                     );
                 } else {
                     let max_offset = long_msg.len() - max_chars;
@@ -879,27 +1466,33 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                     let substr = &long_msg[offset..end];
                     let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::from(substr.as_bytes());
                     buf.push(0);
-                    sys::canvas_draw_str(canvas, dlg_x + 8, dlg_y + 8, buf.as_ptr() as *const i8);
+                    sys::canvas_draw_str(canvas, dlg_x + 8, dlg_y + 8, buf.as_ptr() as *const u8);
                 }
             }
             sys::canvas_draw_str(
                 canvas,
                 dlg_x + 8,
                 dlg_y + 22,
-                b"Copy manually instead\0".as_ptr() as *const i8,
+                b"Copy manually instead\0".as_ptr() as *const u8,
             );
             sys::canvas_draw_str(
                 canvas,
                 dlg_x + 8,
                 dlg_y + dlg_h - 10,
-                b"Left: Back\0".as_ptr() as *const i8,
+                b"Left: Back\0".as_ptr() as *const u8,
             );
             // draw frame last so border is not overwritten; draw two nested frames to ensure visibility
             sys::canvas_set_color(canvas, sys::ColorBlack);
             sys::canvas_draw_frame(canvas, dlg_x, dlg_y, dlg_w as usize, dlg_h as usize);
             // inner frame (thicken)
             if dlg_w > 4 && dlg_h > 4 {
-                sys::canvas_draw_frame(canvas, dlg_x + 1, dlg_y + 1, (dlg_w - 2) as usize, (dlg_h - 2) as usize);
+                sys::canvas_draw_frame(
+                    canvas,
+                    dlg_x + 1,
+                    dlg_y + 1,
+                    (dlg_w - 2) as usize,
+                    (dlg_h - 2) as usize,
+                );
             }
             return;
         } else {
@@ -908,7 +1501,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
             let hex_bytes = hex_str.as_str().as_bytes();
             // Title spacing: 18 pixels below title for private key view
             let label_y = title_height + 18;
-            sys::canvas_draw_str(canvas, 8, label_y, b"Private key:\0".as_ptr() as *const i8);
+            sys::canvas_draw_str(canvas, 8, label_y, b"Private key:\0".as_ptr() as *const u8);
             // compute characters per line based on display width
             let display_w: i32 = 128;
             let char_w: i32 = 6;
@@ -935,13 +1528,21 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                 buf.extend_from_slice(&hex_bytes[start..start + take]);
                 buf.push(0);
                 let y = label_y + 12 + (i as i32) * line_h;
-                sys::canvas_draw_str(canvas, left_pad, y, buf.as_ptr() as *const i8);
+                sys::canvas_draw_str(canvas, left_pad, y, buf.as_ptr() as *const u8);
             }
             // draw scrollbar if needed (on right)
             if total_lines > visible_lines {
                 let track_x = display_w - 6;
                 let track_top = label_y + 12;
-                draw_scrollbar(canvas, scroll, visible_lines, total_lines, track_x, track_top, line_h);
+                draw_scrollbar(
+                    canvas,
+                    scroll,
+                    visible_lines,
+                    total_lines,
+                    track_x,
+                    track_top,
+                    line_h,
+                );
             }
             return;
         }
@@ -952,7 +1553,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                 canvas,
                 8,
                 title_height + 30,
-                b"No mnemonic\0".as_ptr() as *const i8,
+                b"No mnemonic\0".as_ptr() as *const u8,
             );
             return;
         }
@@ -1053,7 +1654,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                 let arrow_y = hint_y - 2;
                 sys::canvas_draw_box(canvas, arrow_x, arrow_y, 3, 3);
                 sys::canvas_draw_box(canvas, arrow_x - 3, arrow_y + 2, 3, 3);
-                sys::canvas_draw_str(canvas, hint_x + 8, hint_y, hint_text.as_ptr() as *const i8);
+                sys::canvas_draw_str(canvas, hint_x + 8, hint_y, hint_text.as_ptr() as *const u8);
                 return;
             }
         }
@@ -1072,7 +1673,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
             canvas,
             dlg_x + 8,
             dlg_y + 10,
-            b"QR too long for ECC=L\0".as_ptr() as *const i8,
+            b"QR too long for ECC=L\0".as_ptr() as *const u8,
         );
         // Scroll the long dialog message if it doesn't fit
         {
@@ -1085,7 +1686,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                     canvas,
                     dlg_x + 8,
                     dlg_y + 25,
-                    long_msg.as_ptr() as *const i8,
+                    long_msg.as_ptr() as *const u8,
                 );
             } else {
                 let max_offset = long_msg.len() - max_chars;
@@ -1098,7 +1699,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                 // prepare nul-terminated buffer
                 let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::from(substr.as_bytes());
                 buf.push(0);
-                sys::canvas_draw_str(canvas, dlg_x + 8, dlg_y + 25, buf.as_ptr() as *const i8);
+                sys::canvas_draw_str(canvas, dlg_x + 8, dlg_y + 25, buf.as_ptr() as *const u8);
             }
         }
 
@@ -1107,7 +1708,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
             canvas,
             dlg_x + 8,
             dlg_y + dlg_h - 6,
-            b"Left: Back\0".as_ptr() as *const i8,
+            b"Left: Back\0".as_ptr() as *const u8,
         );
         return;
     }
@@ -1117,7 +1718,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
             canvas,
             6,
             title_height + 24,
-            b"No mnemonic\0".as_ptr() as *const i8,
+            b"No mnemonic\0".as_ptr() as *const u8,
         );
         return;
     }
@@ -1173,7 +1774,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                 let nlen = core::cmp::min(sb.len(), num_buf.len() - 1);
                 num_buf[..nlen].copy_from_slice(&sb[..nlen]);
                 num_buf[nlen] = 0;
-                sys::canvas_draw_str(canvas, left_x, y, num_buf.as_ptr() as *const i8);
+                sys::canvas_draw_str(canvas, left_x, y, num_buf.as_ptr() as *const u8);
 
                 // word buffer
                 let wb = w.as_bytes();
@@ -1181,7 +1782,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                 let wlen = core::cmp::min(wb.len(), wbuf.len() - 1);
                 wbuf[..wlen].copy_from_slice(&wb[..wlen]);
                 wbuf[wlen] = 0;
-                sys::canvas_draw_str(canvas, left_word_x, y, wbuf.as_ptr() as *const i8);
+                sys::canvas_draw_str(canvas, left_word_x, y, wbuf.as_ptr() as *const u8);
             }
         }
 
@@ -1194,14 +1795,14 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                 let nlen = core::cmp::min(sb.len(), num_buf.len() - 1);
                 num_buf[..nlen].copy_from_slice(&sb[..nlen]);
                 num_buf[nlen] = 0;
-                sys::canvas_draw_str(canvas, right_x, y, num_buf.as_ptr() as *const i8);
+                sys::canvas_draw_str(canvas, right_x, y, num_buf.as_ptr() as *const u8);
 
                 let wb = w.as_bytes();
                 let mut wbuf: [u8; 48] = [0u8; 48];
                 let wlen = core::cmp::min(wb.len(), wbuf.len() - 1);
                 wbuf[..wlen].copy_from_slice(&wb[..wlen]);
                 wbuf[wlen] = 0;
-                sys::canvas_draw_str(canvas, right_word_x, y, wbuf.as_ptr() as *const i8);
+                sys::canvas_draw_str(canvas, right_word_x, y, wbuf.as_ptr() as *const u8);
             }
         }
     }
@@ -1212,7 +1813,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
             let hex_str = hex::encode(secret_bytes);
             let hex_bytes = hex_str.as_str().as_bytes();
             let label_y = start_y + (visible as i32) * line_h + 4;
-            sys::canvas_draw_str(canvas, 8, label_y, b"Priv key:\0".as_ptr() as *const i8);
+            sys::canvas_draw_str(canvas, 8, label_y, b"Priv key:\0".as_ptr() as *const u8);
             let max_per_line = 32usize;
             let mut pos = 0usize;
             for line in 0..2 {
@@ -1232,7 +1833,7 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                     canvas,
                     8,
                     label_y + ((line as i32) + 1) * line_h,
-                    buf.as_ptr() as *const i8,
+                    buf.as_ptr() as *const u8,
                 );
                 pos += take;
             }
@@ -1248,11 +1849,11 @@ unsafe fn draw_show_mnemonic(canvas: *mut sys::Canvas, state: &AppState) {
                     canvas,
                     8,
                     label_y + ((2 as i32) + 2) * line_h,
-                    b"Left: Back to words\0".as_ptr() as *const i8,
+                    b"Left: Back to words\0".as_ptr() as *const u8,
                 );
             } else {
                 sys::canvas_draw_box(canvas, 90, 24, 36, 36);
-                sys::canvas_draw_str(canvas, 92, 26, b"QR\0".as_ptr() as *const i8);
+                sys::canvas_draw_str(canvas, 92, 26, b"QR\0".as_ptr() as *const u8);
             }
         }
     }
@@ -1313,25 +1914,25 @@ unsafe fn draw_about(canvas: *mut sys::Canvas, state: &AppState) {
         canvas,
         x_off,
         title_height,
-        b"Flipper Zero Crypto Wallet\0".as_ptr() as *const i8,
+        b"Flipper Zero Crypto Wallet\0".as_ptr() as *const u8,
     );
     sys::canvas_draw_str(
         canvas,
         x_off,
         title_height + 16,
-        b"Version 1.0.0\0".as_ptr() as *const i8,
+        b"Version 1.0.0\0".as_ptr() as *const u8,
     );
     sys::canvas_draw_str(
         canvas,
         x_off,
         title_height + 16 * 2,
-        b"Written by Blueokanna\0".as_ptr() as *const i8,
+        b"Written by Blueokanna\0".as_ptr() as *const u8,
     );
     sys::canvas_draw_str(
         canvas,
         x_off,
         title_height + 16 * 3,
-        b"Developed in Rust\0".as_ptr() as *const i8,
+        b"Developed in Rust\0".as_ptr() as *const u8,
     );
 }
 
@@ -1342,12 +1943,13 @@ unsafe fn draw_confirm_dialog(canvas: *mut sys::Canvas, state: &AppState) {
     let msg = match state.confirm_action {
         ConfirmAction::DeleteWallet => b"Delete wallet?     \0",
         ConfirmAction::ExportMnemonic => b"Export mnemonic?   \0",
+        ConfirmAction::SaveWallet => b"Save wallet to SD? \0",
         ConfirmAction::ClearPassphrase => b"Clear passphrase   \0",
         ConfirmAction::RevealPrivate => b"Reveal Private Key?\0",
         ConfirmAction::None => b"Confirm?           \0",
     };
 
-    sys::canvas_draw_str(canvas, 8, 8, msg.as_ptr() as *const i8);
+    sys::canvas_draw_str(canvas, 8, 8, msg.as_ptr() as *const u8);
     let options = ["Yes", "No"];
     let display_w: i32 = 128;
     let spacing: i32 = 8;
@@ -1377,7 +1979,7 @@ unsafe fn draw_confirm_dialog(canvas: *mut sys::Canvas, state: &AppState) {
         }
         let half_h = box_h / 2;
         let text_y = box_top + half_h - 1;
-        sys::canvas_draw_str(canvas, text_x, text_y, buf.as_ptr() as *const i8);
+        sys::canvas_draw_str(canvas, text_x, text_y, buf.as_ptr() as *const u8);
     }
 }
 
@@ -1465,13 +2067,50 @@ unsafe fn draw_menu_list(
         }
         // draw text baseline inside the box (baseline is measured from top)
         let text_y = box_top + box_height as i32 - 4;
-        sys::canvas_draw_str(canvas, margin + 6, text_y, items[idx].as_ptr() as *const i8);
+        sys::canvas_draw_str(canvas, margin + 6, text_y, items[idx].as_ptr() as *const u8);
     }
     // draw scrollbar if needed
     if count > visible {
         let track_x = DISPLAY_WIDTH - 6;
         let track_top = start_y - 2;
         draw_scrollbar(canvas, scroll, visible, count, track_x, track_top, line_h);
+    }
+}
+
+// Compute prefix suggestions into state (no heap) based on current fragment.
+fn compute_suggestions_for_prefix(state: &mut AppState, prefix: &str) {
+    let pbytes = prefix.as_bytes();
+    let plen = pbytes.len();
+    state.suggestion_count = 0;
+    state.suggestion_total = 0;
+    if plen < 2 {
+        return;
+    }
+    for (i, &w) in ENGLISH_WORD_LIST.iter().enumerate() {
+        let wb = w.as_bytes();
+        if wb.len() < plen {
+            continue;
+        }
+        let mut matched = true;
+        for j in 0..plen {
+            let a = wb[j];
+            let b = pbytes[j];
+            let b_lower = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+            if a != b_lower {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            if state.suggestion_count < SUGGESTION_MAX {
+                state.suggestion_indices[state.suggestion_count] = i;
+                state.suggestion_count += 1;
+            }
+            state.suggestion_total += 1;
+        }
+    }
+    if state.suggestion_selected >= state.suggestion_count {
+        state.suggestion_selected = 0;
     }
 }
 
@@ -1488,7 +2127,9 @@ extern "C" fn input_callback(event: *mut sys::InputEvent, ctx: *mut c_void) {
         }
         let state = &mut *state;
 
-        if evt.type_ != sys::InputTypePress {
+        // Prefer handling Short and Repeat events to avoid double-processing
+        // (some hardware sends both Press and Short for a single tap).
+        if !(evt.type_ == sys::InputTypeShort || evt.type_ == sys::InputTypeRepeat) {
             return;
         }
 
@@ -1576,6 +2217,252 @@ fn handle_create_wallet(state: &mut AppState, evt: &sys::InputEvent) {
 }
 
 fn handle_import_wallet(state: &mut AppState, evt: &sys::InputEvent) {
+    // If selecting a word from the BIP39 list, handle wordlist navigation and selection
+    if state.selecting_word {
+        match evt.key {
+            sys::InputKeyUp => {
+                if state.wordlist_index > 0 {
+                    state.wordlist_index -= 1;
+                } else if state.import_word_index > 0 {
+                    // go back to previous word (do not delete)
+                    state.import_word_index = state.import_word_index.saturating_sub(1);
+                }
+            }
+            sys::InputKeyDown => {
+                if state.wordlist_index + 1 < ENGLISH_WORD_LIST.len() {
+                    state.wordlist_index += 1;
+                }
+            }
+            sys::InputKeyLeft => {
+                // page up
+                let page = MAIN_MENU_VISIBLE;
+                state.wordlist_index = state.wordlist_index.saturating_sub(page);
+            }
+            sys::InputKeyRight => {
+                // page down
+                let page = MAIN_MENU_VISIBLE;
+                state.wordlist_index =
+                    core::cmp::min(state.wordlist_index + page, ENGLISH_WORD_LIST.len() - 1);
+            }
+            sys::InputKeyOk => {
+                // ensure import_words capacity
+                if state.import_words.len() < state.import_total_words {
+                    while state.import_words.len() < state.import_total_words {
+                        state.import_words.push(alloc::string::String::new());
+                    }
+                }
+                // choose highlighted word
+                let chosen = ENGLISH_WORD_LIST[state.wordlist_index];
+                state.import_words[state.import_word_index] = alloc::string::String::from(chosen);
+                if state.import_word_index + 1 < state.import_total_words {
+                    state.import_word_index += 1;
+                    state.wordlist_index = 0;
+                } else {
+                    // finished entering words
+                    state.selecting_word = false;
+                    state.input_mode = InputMode::Navigation;
+                    state.menu_index = 0;
+                }
+            }
+            sys::InputKeyBack => {
+                // cancel selection, keep entered words
+                state.selecting_word = false;
+                state.input_mode = InputMode::Navigation;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // If we're in text input mode for entering words, handle navigation/accept/backspace here.
+    if state.input_mode == InputMode::TextInput {
+        // recompute suggestions based on current fragment so navigation works, but skip for passphrase
+        if !state.editing_passphrase {
+            // copy fragment into stack buffer inside a small scope so immutable borrows end before mutable borrow
+            let mut prefix_buf: [u8; 32] = [0u8; 32];
+            let copy_len = {
+                if state.import_words.len() > state.import_word_index {
+                    let src = state.import_words[state.import_word_index].as_bytes();
+                    let len = core::cmp::min(src.len(), prefix_buf.len() - 1);
+                    prefix_buf[..len].copy_from_slice(&src[..len]);
+                    len
+                } else {
+                    0
+                }
+            };
+            let prefix_str = match core::str::from_utf8(&prefix_buf[..copy_len]) {
+                Ok(s) => s,
+                Err(_) => "",
+            };
+            compute_suggestions_for_prefix(state, prefix_str);
+        }
+        match evt.key {
+            sys::InputKeyUp => {
+                // if suggestions available, move selection up; otherwise cycle charset backward
+                if state.suggestion_count > 0 {
+                    if state.suggestion_selected > 0 {
+                        state.suggestion_selected -= 1;
+                    }
+                } else {
+                    if state.char_index == 0 {
+                        state.char_index = CHARSET.len() - 1;
+                    } else {
+                        state.char_index -= 1;
+                    }
+                }
+            }
+            sys::InputKeyDown => {
+                // if suggestions available, move selection down; otherwise cycle charset forward
+                if state.suggestion_count > 0 {
+                    if state.suggestion_selected + 1 < state.suggestion_count {
+                        state.suggestion_selected += 1;
+                    }
+                } else {
+                    state.char_index = (state.char_index + 1) % CHARSET.len();
+                }
+            }
+            sys::InputKeyLeft => {
+                // delete last character
+                if state.editing_passphrase {
+                    if state.passphrase_len > 0 {
+                        state.passphrase_len -= 1;
+                        state.passphrase_buffer[state.passphrase_len] = 0;
+                    }
+                } else {
+                    if state.import_words.len() <= state.import_word_index {
+                        while state.import_words.len() <= state.import_word_index {
+                            state.import_words.push(alloc::string::String::new());
+                        }
+                    }
+                    let s = &mut state.import_words[state.import_word_index];
+                    s.pop();
+                    // recompute suggestions
+                    let mut pbuf: [u8; 32] = [0u8; 32];
+                    let plen = {
+                        if state.import_words.len() > state.import_word_index {
+                            let src = state.import_words[state.import_word_index].as_bytes();
+                            let len = core::cmp::min(src.len(), pbuf.len() - 1);
+                            pbuf[..len].copy_from_slice(&src[..len]);
+                            len
+                        } else {
+                            0
+                        }
+                    };
+                    let prefix_str = match core::str::from_utf8(&pbuf[..plen]) {
+                        Ok(s) => s,
+                        Err(_) => "",
+                    };
+                    compute_suggestions_for_prefix(state, prefix_str);
+                }
+            }
+            sys::InputKeyRight => {
+                // accept highlighted suggestion if present; otherwise accept current fragment (advance)
+                if state.editing_passphrase {
+                    state.input_mode = InputMode::Navigation;
+                    state.use_system_keyboard = false;
+                } else if state.suggestion_count > 0 {
+                    let sel = if state.suggestion_selected < state.suggestion_count {
+                        state.suggestion_selected
+                    } else {
+                        0usize
+                    };
+                    let chosen_idx = state.suggestion_indices[sel];
+                    let chosen = ENGLISH_WORD_LIST[chosen_idx];
+                    if state.import_words.len() <= state.import_word_index {
+                        while state.import_words.len() <= state.import_word_index {
+                            state.import_words.push(alloc::string::String::new());
+                        }
+                    }
+                    state.import_words[state.import_word_index] =
+                        alloc::string::String::from(chosen);
+                    if state.import_word_index + 1 < state.import_total_words {
+                        state.import_word_index += 1;
+                        if state.import_words.len() <= state.import_word_index {
+                            state.import_words.push(alloc::string::String::new());
+                        } else {
+                            state.import_words[state.import_word_index].clear();
+                        }
+                        state.suggestion_count = 0;
+                        state.suggestion_selected = 0;
+                    } else {
+                        state.input_mode = InputMode::Navigation;
+                        state.use_system_keyboard = false;
+                    }
+                } else {
+                    if state.import_words.len() <= state.import_word_index {
+                        while state.import_words.len() <= state.import_word_index {
+                            state.import_words.push(alloc::string::String::new());
+                        }
+                    }
+                    let frag = state.import_words[state.import_word_index].trim();
+                    if !frag.is_empty() {
+                        if state.import_word_index + 1 < state.import_total_words {
+                            state.import_word_index += 1;
+                            if state.import_words.len() <= state.import_word_index {
+                                state.import_words.push(alloc::string::String::new());
+                            } else {
+                                state.import_words[state.import_word_index].clear();
+                            }
+                        } else {
+                            state.input_mode = InputMode::Navigation;
+                            state.use_system_keyboard = false;
+                        }
+                    }
+                }
+            }
+            sys::InputKeyOk => {
+                // insert currently selected CHARSET character (or do nothing if CHARSET invalid)
+                let key = CHARSET[state.char_index];
+                if state.editing_passphrase {
+                    let kb = key.as_bytes();
+                    for &b in kb.iter() {
+                        if state.passphrase_len + 1 < state.passphrase_buffer.len() {
+                            state.passphrase_buffer[state.passphrase_len] = b;
+                            state.passphrase_len += 1;
+                        }
+                    }
+                    if state.passphrase_len < state.passphrase_buffer.len() {
+                        state.passphrase_buffer[state.passphrase_len] = 0;
+                    }
+                } else {
+                    if state.import_words.len() <= state.import_word_index {
+                        while state.import_words.len() <= state.import_word_index {
+                            state.import_words.push(alloc::string::String::new());
+                        }
+                    }
+                    let s = &mut state.import_words[state.import_word_index];
+                    s.push_str(key);
+                    // recompute suggestions
+                    let mut pbuf: [u8; 32] = [0u8; 32];
+                    let plen = {
+                        if state.import_words.len() > state.import_word_index {
+                            let src = state.import_words[state.import_word_index].as_bytes();
+                            let len = core::cmp::min(src.len(), pbuf.len() - 1);
+                            pbuf[..len].copy_from_slice(&src[..len]);
+                            len
+                        } else {
+                            0
+                        }
+                    };
+                    let prefix_str = match core::str::from_utf8(&pbuf[..plen]) {
+                        Ok(s) => s,
+                        Err(_) => "",
+                    };
+                    compute_suggestions_for_prefix(state, prefix_str);
+                }
+            }
+            sys::InputKeyBack => {
+                // exit text input
+                state.input_mode = InputMode::Navigation;
+                state.use_system_keyboard = false;
+                state.suggestion_count = 0;
+                state.suggestion_selected = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
+    // Normal import menu navigation
     match evt.key {
         sys::InputKeyUp => {
             if state.menu_index > 0 {
@@ -1588,11 +2475,70 @@ fn handle_import_wallet(state: &mut AppState, evt: &sys::InputEvent) {
             }
         }
         sys::InputKeyOk => match state.menu_index {
-            0 => state.input_mode = InputMode::TextInput,
-            1 => {}
+            0 => {
+                // begin manual word entry using on-screen keyboard (per-word manual input)
+                // switch to text input and mark that we will use the system keyboard/dialog
+                state.selecting_word = false;
+                state.input_mode = InputMode::TextInput;
+                state.use_system_keyboard = true;
+                state.editing_passphrase = false;
+                state.import_total_words = state.bip39_word_count;
+                state.import_word_index = 0;
+                state.wordlist_index = 0;
+                state.import_words.clear();
+                while state.import_words.len() < state.import_total_words {
+                    state.import_words.push(alloc::string::String::new());
+                }
+                state.keyboard_index = 0;
+                state.suggestion_count = 0;
+                state.suggestion_selected = 0;
+            }
+            1 => {
+                // edit BIP39 passphrase via on-screen keyboard
+                state.input_mode = InputMode::TextInput;
+                state.use_system_keyboard = true;
+                state.editing_passphrase = true;
+                state.keyboard_index = 0;
+                // clear current passphrase buffer
+                state.clear_passphrase();
+                state.suggestion_count = 0;
+                state.suggestion_selected = 0;
+            }
             2 => {
-                state.current_screen = Screen::ViewWallets;
-                state.menu_index = 0;
+                // Confirm import: validate mnemonic and create wallet in-memory
+                let mut phrase = alloc::string::String::new();
+                for (i, w) in state.import_words.iter().enumerate() {
+                    if i > 0 {
+                        phrase.push(' ');
+                    }
+                    phrase.push_str(w.as_str());
+                }
+                let words_vec: alloc::vec::Vec<&str> = phrase.split_whitespace().collect();
+                if words_vec.len() == state.import_total_words
+                    && crate::bip39::validate_mnemonic(&words_vec)
+                {
+                    if let Ok(mut wallet) = Wallet::from_mnemonic(
+                        phrase.as_str(),
+                        core::str::from_utf8(&state.passphrase_buffer[..state.passphrase_len])
+                            .unwrap_or(""),
+                    ) {
+                        // add default first account for display
+                        let _ = wallet.add_account(crate::address::Cryptocurrency::Bitcoin, 0, 0);
+                        state.wallets.push(wallet);
+                        state.current_wallet = state.wallets.len().saturating_sub(1);
+                        state.current_screen = Screen::ViewWallets;
+                        state.menu_index = 0;
+                    } else {
+                        // invalid mnemonic -> show error confirmation
+                        state.confirm_action = ConfirmAction::ExportMnemonic;
+                        state.confirm_index = 1;
+                        state.current_screen = Screen::ConfirmAction;
+                    }
+                } else {
+                    state.confirm_action = ConfirmAction::ExportMnemonic;
+                    state.confirm_index = 1;
+                    state.current_screen = Screen::ConfirmAction;
+                }
             }
             _ => {}
         },
@@ -1601,6 +2547,8 @@ fn handle_import_wallet(state: &mut AppState, evt: &sys::InputEvent) {
             state.menu_index = 1;
             state.clear_mnemonic();
             state.clear_passphrase();
+            state.import_words.clear();
+            state.selecting_word = false;
         }
         _ => {}
     }
@@ -1659,6 +2607,9 @@ fn handle_show_mnemonic(state: &mut AppState, evt: &sys::InputEvent) {
             state.current_screen = Screen::MainMenu;
             state.menu_index = 0;
             state.clear_mnemonic();
+            // clear one-time AES display
+            state.last_saved_aes_len = 0;
+            state.last_saved_path.clear();
         }
         sys::InputKeyUp => {
             if state.show_private {
@@ -1679,12 +2630,17 @@ fn handle_show_mnemonic(state: &mut AppState, evt: &sys::InputEvent) {
                 let display_w: i32 = 128;
                 let char_w: i32 = 6;
                 let left_pad: i32 = 8;
-                let max_per_line = core::cmp::max(1, ((display_w - left_pad * 2) / char_w) as usize);
+                let max_per_line =
+                    core::cmp::max(1, ((display_w - left_pad * 2) / char_w) as usize);
                 let total_lines = (hex_str.as_bytes().len() + max_per_line - 1) / max_per_line;
                 let avail_h = 64 - ((8 + 12) + 12); // title_height + label_y + reserve
                 let line_h = 12usize;
                 let visible = core::cmp::max(1, (avail_h as usize) / line_h);
-                let max_scroll = if total_lines > visible { total_lines - visible } else { 0 };
+                let max_scroll = if total_lines > visible {
+                    total_lines - visible
+                } else {
+                    0
+                };
                 if state.private_scroll < max_scroll {
                     state.private_scroll += 1;
                 }
@@ -1719,6 +2675,12 @@ fn handle_show_mnemonic(state: &mut AppState, evt: &sys::InputEvent) {
                 state.showing_qr = true;
             }
         }
+        sys::InputKeyOk => {
+            // Prompt to save this wallet to SD card (confirm dialog)
+            state.confirm_action = ConfirmAction::SaveWallet;
+            state.confirm_index = 0;
+            state.current_screen = Screen::ConfirmAction;
+        }
         sys::InputKeyLeft => {
             // if QR is showing, return to words view; otherwise go back
             if state.showing_qr {
@@ -1726,6 +2688,9 @@ fn handle_show_mnemonic(state: &mut AppState, evt: &sys::InputEvent) {
             } else {
                 state.current_screen = Screen::MainMenu;
                 state.menu_index = 0;
+                // clear one-time AES display
+                state.last_saved_aes_len = 0;
+                state.last_saved_path.clear();
             }
         }
         _ => {}
@@ -1758,12 +2723,44 @@ fn handle_confirm(state: &mut AppState, evt: &sys::InputEvent) {
                         state.show_private = true;
                         state.current_screen = Screen::ShowMnemonic;
                     }
+                    ConfirmAction::ExportMnemonic => {
+                        // legacy action used elsewhere as an export/validation marker; no-op here
+                    }
+                    ConfirmAction::SaveWallet => {
+                        // For stability, perform an immediate in-memory save (no heavy crypto/IO here).
+                        // Build wallet from current mnemonic/passphrase and add to memory.
+                        let mnemonic_str = match core::str::from_utf8(&state.mnemonic_buffer) {
+                            Ok(s) => s.trim(),
+                            Err(_) => "",
+                        };
+                        if !mnemonic_str.is_empty() {
+                            if let Ok(mut wallet) = Wallet::from_mnemonic(
+                                mnemonic_str,
+                                core::str::from_utf8(&state.passphrase_buffer[..state.passphrase_len])
+                                    .unwrap_or(""),
+                            ) {
+                                let _ = wallet.add_account(
+                                    crate::address::Cryptocurrency::Bitcoin,
+                                    0,
+                                    0,
+                                );
+                                state.wallets.push(wallet);
+                                state.current_wallet = state.wallets.len().saturating_sub(1);
+                            }
+                        }
+                        state.save_error = 0;
+                        // Navigate to ViewWallets
+                        state.current_screen = Screen::ViewWallets;
+                        state.menu_index = 0;
+                    }
                     _ => {}
                 }
             }
             // If the confirm action was RevealPrivate and user confirmed, keep ShowMnemonic.
-            // Otherwise return to main menu.
-            if state.confirm_action != ConfirmAction::RevealPrivate || state.confirm_index != 0 {
+            // Otherwise return to main menu (unless we already switched screen).
+            if state.confirm_action != ConfirmAction::RevealPrivate
+                && state.confirm_action != ConfirmAction::ExportMnemonic
+            {
                 state.current_screen = Screen::MainMenu;
             }
             state.confirm_action = ConfirmAction::None;
